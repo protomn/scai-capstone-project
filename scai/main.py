@@ -439,6 +439,55 @@ def run_reactive(horizon: int = HORIZON,
 
     return log
 
+def safe_candidate_movements(agent: AgentID, positions: dict[AgentID, RegionID], time: int) -> list[Movement]:
+    """
+    topologically legal and predicted safe movements for one agent
+    """
+    return [m for m in candidate_movements(agent, positions) if movement_is_safe(m, time)]
+
+def safe_joint_assignments(positions: dict[AgentID, RegionID], time: int) -> list[JointAssignment]:
+    """
+    feasible joint assignments built only from safe candidate edges
+    """
+    per_agent = [safe_candidate_movements(agent, positions, time) for agent in sorted(positions)]
+    return [combination for combination in itertools.product(*per_agent) if feasible_assignment(combination, positions)]
+
+def run_anticipatory(horizon: int = HORIZON,
+                     ages: tuple[int, ...] = INITIAL_AGES,
+                     positions: dict[AgentID, RegionID] | None = None,
+                     lam: float = LAMBDA_TRAVEL) -> list[StepLog]:
+    """
+    policy 3: filter unsafe edges, enumerate, choose, execute
+    """ 
+    positions = dict(INITIAL_POSNS if positions is None else positions)
+    cumulative = 0.0
+    log: list[StepLog] = []
+
+    for time in range(1, horizon + 1):
+        assignments = safe_joint_assignments(positions, time)
+        assert assignments, f"no safe assignment at t = {time} (should be impossible)"
+
+        chosen = best_assignment(assignments, ages, lam)
+
+        assert assignment_is_safe(chosen, time), "anticipatory policy leaked unsafe move"
+
+        positions = apply_assignment(chosen)
+        inspected = inspected_regions(positions)
+        next_ages = advance_ages(ages, inspected)
+        step = total_cost(next_ages)
+        cumulative += step
+        log.append(StepLog(time = time,
+                           assignment = chosen, 
+                           inspected = inspected,
+                           ages_after = next_ages,
+                           step_cost = step,
+                           cumulative_cost = cumulative,
+                           rejections = 0,
+                           unsafe_executions = 0,
+                           waits = sum(1 for _a, o, d in chosen if o == d)))
+        ages = next_ages
+    return log
+
 def main() -> None:
 
     check_neighborhood_invariants()
@@ -575,6 +624,18 @@ def main() -> None:
     print(f"rejected = {rejected}   displaced = {displaced}")
 
     assert displaced == {"A2"}
+
+    # policy 3
+    anticipatory = run_anticipatory()
+    print_log("Policy 3: anticipatory safe assignment", anticipatory)
+    assert abs(anticipatory[-1].cumulative_cost - 67.0) < 1e-9
+    assert all(e.rejections == 0 for e in anticipatory)
+    assert all(e.unsafe_executions == 0 for e in anticipatory)
+
+    for entry in anticipatory:
+        assert assignment_is_safe(entry.assignment, entry.time)
+
+    print(" all executed movements safe by construction and check")
 
 if __name__ == "__main__":
     main()
