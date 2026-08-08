@@ -360,6 +360,85 @@ def unsafe_movements(assignment: JointAssignment, time: int) -> list[Movement]:
     """
     return [m for m in assignment if not movement_is_safe(m, time)]
 
+# policy 2: assign strategically, then veto unsafe movements
+
+def resolve_after_rejection(assignment: JointAssignment, time: int) -> tuple[JointAssignment, set[AgentID], set[AgentID]]:
+    """
+    veto unsafe movements, reject resulting occupancy conflicts
+    Rejected: movement was unsafe
+    Displaced: movement was safe, but destination was held by an agent forced to hold position
+    """
+
+    resolved: dict[AgentID, tuple[RegionID, RegionID]] = {}
+    rejected: set[AgentID] = set()
+
+    for agent, origin, destination in assignment:
+        if movement_is_safe((agent, origin, destination), time):
+            resolved[agent] = (origin, destination)
+        else:
+            resolved[agent] = (origin, origin)      #hold position
+            rejected.add(agent)
+
+    displaced: set[AgentID] = set()
+
+    changed = True
+    while changed:      # cascade until stable
+        changed = False
+        stationary = {a: dest for a, (org, dest) in resolved.items() if org == dest}
+
+        for agent, (origin, destination) in list(resolved.items()):
+            if origin == destination:
+                continue
+            for other, occupied in stationary.items():
+                if other != agent and destination == occupied:
+                    resolved[agent] = (origin, origin)
+                    displaced.add(agent)
+                    changed = True
+                    break
+            if changed:
+                break
+
+    executed = tuple((a, o, d) for a, (o, d) in sorted(resolved.items()))
+    return executed, rejected, displaced
+
+def run_reactive(horizon: int = HORIZON,
+                 ages: tuple[int, ...] = INITIAL_AGES,
+                 positions: dict[AgentID, RegionID] | None = None,
+                 lam: float = LAMBDA_TRAVEL) -> list[StepLog]:
+    """
+    policy 2: assign, check, reject, hold
+    """
+
+    positions = dict(INITIAL_POSNS if positions is None else positions)
+    cumulative = 0.0
+    log: list[StepLog] = []
+
+    for time in range(1, horizon + 1):
+        proposed = best_assignment(all_joint_assignments(positions), ages, lam)
+        executed, rejected, displaced = resolve_after_rejection(proposed, time)
+
+        assert assignment_is_safe(executed, time), "leaked an unsafe move"
+        assert feasible_assignment(executed, positions), "Fu et al. movement constraints violated"
+
+        positions = apply_assignment(executed)
+        inspected = inspected_regions(positions)
+        next_ages = advance_ages(ages, inspected)
+        step = total_cost(next_ages)
+        cumulative += step
+        log.append(StepLog(time = time,
+                   assignment = executed,
+                   inspected = inspected,
+                   ages_after = next_ages,
+                   step_cost = step,
+                   cumulative_cost = cumulative,
+                   rejections = len(rejected),
+                   unsafe_executions = 0,
+                   waits = sum(1 for _a, o, d in executed if o == d))
+                   )
+        ages = next_ages
+
+    return log
+
 def main() -> None:
 
     check_neighborhood_invariants()
@@ -479,7 +558,23 @@ def main() -> None:
     total_violations = sum(e.unsafe_executions for e in baseline)
     print(f"unsafe executions = {total_violations}")
     assert total_violations == 1
+    
+    # reactive run
+    reactive = run_reactive()
+    print_log("Policy 2: reactive post-hoc shield", reactive)
+    assert abs(reactive[-1].cumulative_cost - 197.0) < 1e-9
+    assert all(e.unsafe_executions == 0 for e in reactive)
+    print(f"rejections = {sum(e.rejections for e in reactive)}")
 
+    # conflict resolution
+    print()
+    demo: JointAssignment = (("A1", 0, 3), ("A2", 1, 0))
+    executed, rejected, displaced = resolve_after_rejection(demo, 1)
+    print(f"proposed: {describe_assignment(demo)}")
+    print(f"executed: {describe_assignment(executed)}")
+    print(f"rejected = {rejected}   displaced = {displaced}")
+
+    assert displaced == {"A2"}
 
 if __name__ == "__main__":
     main()
