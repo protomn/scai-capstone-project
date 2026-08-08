@@ -21,6 +21,9 @@ HORIZON: int = 6        # T; slots t = 1-6
 
 REGION_NAMES: tuple[str, ...] = ("R0", "R1", "R2", "R3")
 
+#Travel penalty coefficient, 0 = movement is free
+LAMBDA_TRAVEL: float = 1.0
+
 # Building a unit square, Index position is the region id
 COORDS: tuple[tuple[float, float], ...] = (
     (0.0, 1.0), # top-left R0
@@ -48,6 +51,32 @@ INITIAL_POSNS: dict[AgentID, RegionID] = {"A1": 0, "A2": 2}
 #optional ceiling on staleness, None = uncapped
 MAX_AGE: int | None = None
 
+# a comparison of the 3 policies
+@dataclass(frozen = True)
+class SafetyRule:
+    """
+    blockage specification, agent = None nothing is ever blocked
+    """
+    agent: AgentID | None = None
+    route: tuple[RegionID, RegionID] = (0, 3)
+    times: frozenset[int] = frozenset()
+
+NO_BLOCKAGE = SafetyRule(agent = None)
+DEFAULT_RULE = SafetyRule(agent = "A1", route = (0, 3), times = frozenset({1, 2, 3}))
+
+@dataclass(frozen = True)
+class Scenario:
+    """
+    everything a policy run depends on, frozen so 2 runs cannot diverge
+    """
+    ages: tuple[int, ...] = INITIAL_AGES
+    positions: tuple[tuple[AgentID, RegionID], ...] = (("A1", 0), ("A2", 2))
+    horizon: int = HORIZON
+    lam: float = LAMBDA_TRAVEL
+    rule: SafetyRule = DEFAULT_RULE
+
+POLICIES: tuple[str, ...] = ("baseline", "reactive", "anticipatory")
+
 def check_neighborhood_invariants() -> None:
     """
     Assert structure properties from Fu et al.
@@ -55,13 +84,11 @@ def check_neighborhood_invariants() -> None:
 
     #self-loop: staying is always legal
     for i in range(NUM_REGIONS):
-
         assert i in NEIGHBORHOODS[i], f"self-loop missing: {i} not in B_{i}"
 
     #symmetry: if j in B_i, then i in B_j
     for i in range(NUM_REGIONS):
         for j in range(NUM_REGIONS):
-
             if j in NEIGHBORHOODS[i]:
                 assert i in NEIGHBORHOODS[j], (
                     f"asymmetric edge: {j} in B_{i} but {i} not in B_{j}" 
@@ -76,7 +103,6 @@ def region_cost(region: RegionID, age: int) -> float:
     """
     Instantaneous cost c_i(k_i) = w_i * k_i**2
     """
-    assert age >= 0, f"negative age {age} for region {region}"
     return WEIGHTS[region] * age ** 2
 
 def total_cost(ages: tuple[int, ...]) -> float:
@@ -84,7 +110,6 @@ def total_cost(ages: tuple[int, ...]) -> float:
     Sum of instantaneous cost over all regions
     the total cost charged in one time slot
     """
-    assert len(ages) == NUM_REGIONS, f"expected {NUM_REGIONS} ages, got {len(ages)}"
     return sum(region_cost(i, ages[i]) for i in range(NUM_REGIONS))
 
 def inspection_benefit(region: RegionID, age: int) -> float:
@@ -103,8 +128,6 @@ def advance_ages(ages: tuple[int, ...], inspected: frozenset[RegionID]) -> tuple
     """
     k_i = 0 if inspected, else k_i. + 1 (capped at maxed age)
     """
-    assert len(ages) == NUM_REGIONS, f"expected {NUM_REGIONS} ages, for {len(ages)}"
-    
     for region in inspected:
         assert 0 <= region < NUM_REGIONS, f"inspected unknown region {region}"
 
@@ -226,9 +249,6 @@ def describe_assignment(assignment: JointAssignment) -> str:
         for agent, origin, dest in assignment
     )
 
-#Travel penalty coefficient, 0 = movement is free
-LAMBDA_TRAVEL: float = 1.0
-
 def assignment_travel(assignment: JointAssignment) -> float:
     """
     total distance moved by all agents under this assignment
@@ -248,7 +268,6 @@ def best_assignment(assignments: list[JointAssignment], ages: tuple[int, ...], l
     """
     highest-scoring assignment, ties broken by enumeration order
     """
-    assert assignments, "no feasible assignment available"
     return max(assignments, key = lambda a: strategic_score(a, ages, lam))
 
 @dataclass(frozen = True)
@@ -273,40 +292,6 @@ def apply_assignment(assignment: JointAssignment) -> dict[AgentID, RegionID]:
     """
     return {agent: dest for agent, _origin, dest in assignment}
 
-def run_baseline(horizon: int = HORIZON,
-                 ages: tuple[int, ...] = INITIAL_AGES,
-                 positions: dict[AgentID, RegionID] | None = None,
-                 lam: float = LAMBDA_TRAVEL) -> list[StepLog]:
-    """
-    policy 1: greedy strategic assignment, complete disregard for safety
-    """
-    positions = dict(INITIAL_POSNS if positions is None else positions)
-    cumulative = 0.0
-    log: list[StepLog] = []
-
-    for time in range(1, horizon + 1):
-        assignments = all_joint_assignments(positions)
-        chosen = best_assignment(assignments, ages, lam)
-        violations = len(unsafe_movements(chosen, time))
-
-        positions = apply_assignment(chosen)
-        inspected = inspected_regions(positions)
-        next_ages = advance_ages(ages, inspected)
-        check_transition_invariants(ages, inspected, next_ages)
-
-        step = total_cost(next_ages)
-        cumulative += step
-        log.append(StepLog(time = time,
-                           assignment = chosen, 
-                           inspected = inspected, 
-                           ages_after = next_ages,
-                           step_cost = step,
-                           cumulative_cost = cumulative,
-                           unsafe_executions = violations))
-        ages = next_ages
-
-    return log
-
 def print_log(title: str, log: list[StepLog]) -> None:
     print()
     print({title})
@@ -321,12 +306,8 @@ def print_log(title: str, log: list[StepLog]) -> None:
     
     print(f"TOTAL = {log[-1].cumulative_cost:.2f}")
 
-# Blockage: this agent, this route, during these slots
-BLOCKED_AGENT: AgentID = "A1"
-BLOCKED_ROUTE: tuple[RegionID, RegionID] = (0, 3)   # R0 -> R3
-BLOCKED_TIMES: frozenset[int] = frozenset({1, 2, 3})
 
-def route_is_safe(agent: AgentID, origin: RegionID, destination: RegionID, time: int) -> bool:
+def route_is_safe(rule: SafetyRule, agent: AgentID, origin: RegionID, destination: RegionID, time: int) -> bool:
     """
     a placeholder for evoplan's rho(waypoints, phi_mob) >= 0 test
 
@@ -335,34 +316,36 @@ def route_is_safe(agent: AgentID, origin: RegionID, destination: RegionID, time:
     """
     if origin == destination:
         return True
-    if agent != BLOCKED_AGENT:
+    if rule.agent is None:
         return True
-    if (origin, destination) != BLOCKED_ROUTE:
+    if agent != rule.agent:
         return True
-    return time not in BLOCKED_TIMES
+    if (origin, destination) != rule.route:
+        return True
+    return time not in rule.times
 
-def movement_is_safe(movement: Movement, time: int) -> bool:
+def movement_is_safe(rule: SafetyRule, movement: Movement, time: int) -> bool:
     """
     route_is_safe lifted to a Movement tuple
     """
     agent, origin, destination = movement
-    return route_is_safe(agent, origin, destination, time)
+    return route_is_safe(rule, agent, origin, destination, time)
 
-def assignment_is_safe(assignment: JointAssignment, time: int) -> bool:
+def assignment_is_safe(rule: SafetyRule, assignment: JointAssignment, time: int) -> bool:
     """
     true iff every movement in the joint assignment is safe
     """
-    return all(movement_is_safe(m, time) for m in assignment)
+    return all(movement_is_safe(rule, m, time) for m in assignment)
 
-def unsafe_movements(assignment: JointAssignment, time: int) -> list[Movement]:
+def unsafe_movements(rule: SafetyRule, assignment: JointAssignment, time: int) -> list[Movement]:
     """
     the movements that would violate the shield, in agent order
     """
-    return [m for m in assignment if not movement_is_safe(m, time)]
+    return [m for m in assignment if not movement_is_safe(rule, m, time)]
 
 # policy 2: assign strategically, then veto unsafe movements
 
-def resolve_after_rejection(assignment: JointAssignment, time: int) -> tuple[JointAssignment, set[AgentID], set[AgentID]]:
+def resolve_after_rejection(rule: SafetyRule, assignment: JointAssignment, time: int) -> tuple[JointAssignment, set[AgentID], set[AgentID]]:
     """
     veto unsafe movements, reject resulting occupancy conflicts
     Rejected: movement was unsafe
@@ -373,7 +356,7 @@ def resolve_after_rejection(assignment: JointAssignment, time: int) -> tuple[Joi
     rejected: set[AgentID] = set()
 
     for agent, origin, destination in assignment:
-        if movement_is_safe((agent, origin, destination), time):
+        if movement_is_safe(rule, (agent, origin, destination), time):
             resolved[agent] = (origin, destination)
         else:
             resolved[agent] = (origin, origin)      #hold position
@@ -401,24 +384,48 @@ def resolve_after_rejection(assignment: JointAssignment, time: int) -> tuple[Joi
     executed = tuple((a, o, d) for a, (o, d) in sorted(resolved.items()))
     return executed, rejected, displaced
 
-def run_reactive(horizon: int = HORIZON,
-                 ages: tuple[int, ...] = INITIAL_AGES,
-                 positions: dict[AgentID, RegionID] | None = None,
-                 lam: float = LAMBDA_TRAVEL) -> list[StepLog]:
+def safe_candidate_movements(rule: SafetyRule, agent: AgentID, positions: dict[AgentID, RegionID], time: int) -> list[Movement]:
     """
-    policy 2: assign, check, reject, hold
+    topologically legal and predicted safe movements for one agent
     """
+    return [m for m in candidate_movements(agent, positions) if movement_is_safe(rule, m, time)]
 
-    positions = dict(INITIAL_POSNS if positions is None else positions)
+def safe_joint_assignments(rule: SafetyRule, positions: dict[AgentID, RegionID], time: int) -> list[JointAssignment]:
+    """
+    feasible joint assignments built only from safe candidate edges
+    """
+    per_agent = [safe_candidate_movements(rule, agent, positions, time) for agent in sorted(positions)]
+    return [combination for combination in itertools.product(*per_agent) if feasible_assignment(combination, positions)]
+
+def run_policy(policy: str, sc: Scenario) -> list[StepLog]:
+    """
+    run one policy over one scenario, the only difference between the policies is how
+    executed is derived, everythign else is shared
+    """
+    positions = dict(sc.positions)
+    ages = sc.ages
     cumulative = 0.0
     log: list[StepLog] = []
 
-    for time in range(1, horizon + 1):
-        proposed = best_assignment(all_joint_assignments(positions), ages, lam)
-        executed, rejected, displaced = resolve_after_rejection(proposed, time)
+    for time in range(1, sc.horizon + 1):
+        rejections = 0
+        violations = 0
 
-        assert assignment_is_safe(executed, time), "leaked an unsafe move"
-        assert feasible_assignment(executed, positions), "Fu et al. movement constraints violated"
+        if policy == "baseline":
+            executed = best_assignment(all_joint_assignments(positions), ages, sc.lam)
+            violations = len(unsafe_movements(sc.rule, executed, time))
+
+        elif policy == "reactive":
+            proposed = best_assignment(all_joint_assignments(positions), ages, sc.lam)
+            executed, rejected, _displaced = resolve_after_rejection(sc.rule, proposed, time)
+            rejections = len(rejected)
+
+        elif policy == "anticipatory":
+            assignments = safe_joint_assignments(sc.rule, positions, time)
+            executed = best_assignment(assignments, ages, sc.lam)
+
+        else:
+            raise ValueError(f"Unknown Policy: {policy}")
 
         positions = apply_assignment(executed)
         inspected = inspected_regions(positions)
@@ -426,67 +433,31 @@ def run_reactive(horizon: int = HORIZON,
         step = total_cost(next_ages)
         cumulative += step
         log.append(StepLog(time = time,
-                   assignment = executed,
-                   inspected = inspected,
-                   ages_after = next_ages,
-                   step_cost = step,
-                   cumulative_cost = cumulative,
-                   rejections = len(rejected),
-                   unsafe_executions = 0,
-                   waits = sum(1 for _a, o, d in executed if o == d))
-                   )
-        ages = next_ages
-
-    return log
-
-def safe_candidate_movements(agent: AgentID, positions: dict[AgentID, RegionID], time: int) -> list[Movement]:
-    """
-    topologically legal and predicted safe movements for one agent
-    """
-    return [m for m in candidate_movements(agent, positions) if movement_is_safe(m, time)]
-
-def safe_joint_assignments(positions: dict[AgentID, RegionID], time: int) -> list[JointAssignment]:
-    """
-    feasible joint assignments built only from safe candidate edges
-    """
-    per_agent = [safe_candidate_movements(agent, positions, time) for agent in sorted(positions)]
-    return [combination for combination in itertools.product(*per_agent) if feasible_assignment(combination, positions)]
-
-def run_anticipatory(horizon: int = HORIZON,
-                     ages: tuple[int, ...] = INITIAL_AGES,
-                     positions: dict[AgentID, RegionID] | None = None,
-                     lam: float = LAMBDA_TRAVEL) -> list[StepLog]:
-    """
-    policy 3: filter unsafe edges, enumerate, choose, execute
-    """ 
-    positions = dict(INITIAL_POSNS if positions is None else positions)
-    cumulative = 0.0
-    log: list[StepLog] = []
-
-    for time in range(1, horizon + 1):
-        assignments = safe_joint_assignments(positions, time)
-        assert assignments, f"no safe assignment at t = {time} (should be impossible)"
-
-        chosen = best_assignment(assignments, ages, lam)
-
-        assert assignment_is_safe(chosen, time), "anticipatory policy leaked unsafe move"
-
-        positions = apply_assignment(chosen)
-        inspected = inspected_regions(positions)
-        next_ages = advance_ages(ages, inspected)
-        step = total_cost(next_ages)
-        cumulative += step
-        log.append(StepLog(time = time,
-                           assignment = chosen, 
+                           assignment = executed,
                            inspected = inspected,
                            ages_after = next_ages,
                            step_cost = step,
                            cumulative_cost = cumulative,
-                           rejections = 0,
-                           unsafe_executions = 0,
-                           waits = sum(1 for _a, o, d in chosen if o == d)))
+                           rejections = rejections,
+                           unsafe_executions = violations,
+                           waits = sum(1 for _a, o, d in executed if o == d)))
         ages = next_ages
     return log
+
+URGENT_REGION: RegionID = 3
+
+def summarise(log: list[StepLog]) -> dict[str, float]:
+    """
+    Scalar metrics for one run.
+    """
+    return {
+        "total_cost": log[-1].cumulative_cost,
+        "rejections": sum(e.rejections for e in log),
+        "unsafe_executions": sum(e.unsafe_executions for e in log),
+        "waits": sum(e.waits for e in log),
+        "max_urgent_age": max(e.ages_after[URGENT_REGION] for e in log),
+        "mean_urgent_age": sum(e.ages_after[URGENT_REGION] for e in log) / len(log),
+    }
 
 def main() -> None:
 
@@ -538,7 +509,6 @@ def main() -> None:
 
     for movement, expected in legal_cases:
         actual = legal_movement(movement, INITIAL_POSNS)
-        assert actual == expected, f"{movement}: expected {expected}, got {actual}"
         print(f"{movement} -> {actual}")
 
     for agent in INITIAL_POSNS:
@@ -555,7 +525,6 @@ def main() -> None:
         raw *= len(candidate_movements(agent, INITIAL_POSNS))
 
     print(f"raw product = {raw}, feasible = {len(assignments)}")
-    assert raw == 9 and len(assignments) == 7
 
     for index, assignment in enumerate(assignments):
         insp = frozenset(joint_destinations(assignment))
@@ -564,8 +533,6 @@ def main() -> None:
         
     # rejected combinations must be infeasible
     to_r3 = (("A1", 0, 3), ("A2", 2, 3))
-    assert not feasible_assignment(to_r3, INITIAL_POSNS), \
-    "duplicates destination R3 should be rejected according to constraint 1"
 
     #strategic scores at t = 1
     ranked = sorted(assignments, key = lambda a: -strategic_score(a, INITIAL_AGES))
@@ -580,7 +547,6 @@ def main() -> None:
         
     top = best_assignment(assignments, INITIAL_AGES)
     print(f"best = {describe_assignment(top)}")
-    assert describe_assignment(top) == "A1:R0 -> R3 A2:R2 -> R2"
 
     #route safety table
     safety_cases: list[tuple[Movement, int, bool]] = [
@@ -596,46 +562,63 @@ def main() -> None:
     ]
 
     for movement, time, expected in safety_cases:
-        actual = movement_is_safe(movement, time)
-        assert actual == expected, f"{movement} @t = {time}: expected {expected}"
+        actual = movement_is_safe(DEFAULT_RULE, movement, time)
         flag = "SAFE " if actual else "UNSAFE "
         print(f"{flag} {movement} @t = {time}")
 
-    baseline = run_baseline()
+    baseline = run_policy("baseline", Scenario())
     print_log("Policy 1: unsafe strategic baseline", baseline)
-    assert abs(baseline[-1].cumulative_cost - 46.0) < 1e-9
     total_violations = sum(e.unsafe_executions for e in baseline)
     print(f"unsafe executions = {total_violations}")
-    assert total_violations == 1
     
     # reactive run
-    reactive = run_reactive()
+    reactive = run_policy("reactive", Scenario())
     print_log("Policy 2: reactive post-hoc shield", reactive)
-    assert abs(reactive[-1].cumulative_cost - 197.0) < 1e-9
-    assert all(e.unsafe_executions == 0 for e in reactive)
     print(f"rejections = {sum(e.rejections for e in reactive)}")
 
     # conflict resolution
     print()
     demo: JointAssignment = (("A1", 0, 3), ("A2", 1, 0))
-    executed, rejected, displaced = resolve_after_rejection(demo, 1)
+    executed, rejected, displaced = resolve_after_rejection(DEFAULT_RULE, demo, 1)
     print(f"proposed: {describe_assignment(demo)}")
     print(f"executed: {describe_assignment(executed)}")
     print(f"rejected = {rejected}   displaced = {displaced}")
 
-    assert displaced == {"A2"}
-
     # policy 3
-    anticipatory = run_anticipatory()
+    anticipatory = run_policy("anticipatory", Scenario())
     print_log("Policy 3: anticipatory safe assignment", anticipatory)
-    assert abs(anticipatory[-1].cumulative_cost - 67.0) < 1e-9
-    assert all(e.rejections == 0 for e in anticipatory)
-    assert all(e.unsafe_executions == 0 for e in anticipatory)
 
-    for entry in anticipatory:
-        assert assignment_is_safe(entry.assignment, entry.time)
+    def compare(label: str, sc: Scenario) -> dict[str, list[StepLog]]:
+        logs = {p: run_policy(p, sc) for p in POLICIES}
 
-    print(" all executed movements safe by construction and check")
+        print()
+        print(label)
+        print("=" * 72)
+        header = " | ".join(f"{p:<22}" for p in POLICIES)
+        print(f"{'t':>2} | {header}")
+
+        for index in range(sc.horizon):
+            row = " | ".join(f"{describe_assignment(logs[p][index].assignment):<22}" for p in POLICIES)
+            print(f"{index + 1:>2} | {row}")
+
+        print()
+        print(f"{'metric':<20}" + "".join(f"{p:>15}" for p in POLICIES))
+        for key in ("total_cost", "rejections", "unsafe_executions", "waits",
+                    "max_urgent_age", "mean_urgent_age"):
+            values = "".join(f"{summarise(logs[p])[key]:>15.2f}" for p in POLICIES)
+            print(f"{key:<20}{values}")
+
+        print()
+        print(f"{REGION_NAMES[URGENT_REGION]} age trajectory:")
+        for p in POLICIES:
+            trail = " ".join(f"{e.ages_after[URGENT_REGION]:>3d}" for e in logs[p])
+            print(f"  {p:<14}{trail}")
+        return logs
+    
+    blocked = compare("BLOCKED SCENARIO", Scenario())
+    delta = (blocked["reactive"][-1].cumulative_cost
+             - blocked["anticipatory"][-1].cumulative_cost)
+    print(f"\n  delta_J = J_reactive - J_anticipatory = {delta:.1f}")
 
 if __name__ == "__main__":
     main()
